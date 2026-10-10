@@ -18,6 +18,10 @@ pub const Error = error{
     OutOfBounds,
     NonExhaustiveEnum,
     InvalidEnum,
+    UnknownKey,
+    UnsortedKeys,
+    DuplicateKey,
+    MissingField,
 };
 
 /// Get the size that a value have when encoded.
@@ -187,34 +191,56 @@ fn encode_int(value: anytype, w: *Writer) !void {
 /// Dicts are encoded as `d<str><val>e`.
 /// For example: `d3:fooi2ee`.
 fn decode_dict(comptime T: type, r: *Reader) !T {
-    const data = r.buffer[r.seek..];
-
-    // empty dict
-    if (std.mem.eql(u8, data, "de")) {
-        r.toss(1);
-        return Error.Empty;
-    }
-
-    if (data.len < 3 or
-        (data[0] != 'd' or data[data.len - 1] != 'e'))
-    {
-        return Error.MalformedBuffer;
-    }
+    if (r.seek >= r.buffer.len or r.buffer[r.seek] != 'd') return Error.MalformedBuffer;
 
     var dict: T = undefined;
+    var seen: std.EnumSet(std.meta.FieldEnum(T)) = .empty;
     const s = @typeInfo(T).@"struct";
+    var prev_key: ?[]const u8 = null;
 
-    inline for (s.field_names, s.field_types) |n, t| {
-        // enter the field str `3:foo...`
+    // cursor at d3:foo
+    //           ^
+    r.toss(1);
+    // cursor at d3:foo
+    //            ^
+
+    while (r.buffer[r.seek] != 'e') {
+        const key = try decode_str(r);
+        // cursor at d3:foo
+        //             ^
+
+        // advance into the value's first byte
+        // cursor at d3:foo
+        //              ^
         r.toss(1);
-        // skip the string into the value `i2e...`
-        try skip_str(r);
-        // enter the next data structure `i2e^`
+
+        if (prev_key) |pk| {
+            // if (std.mem.order(u8, pk, key) != .lt) return Error.UnsortedKeys;
+            if (std.mem.order(u8, pk, key) == .gt) return Error.UnsortedKeys;
+        }
+        prev_key = key;
+
+        found: {
+            inline for (s.field_names, s.field_types) |n, ft| {
+                if (std.mem.eql(u8, n, key)) {
+                    const F = std.meta.FieldEnum(T);
+                    if (seen.contains(@field(F, n))) return Error.DuplicateKey;
+                    seen.insert(@field(F, n));
+                    @field(dict, n) = try decode(ft, r);
+                    break :found;
+                }
+            }
+            return Error.UnknownKey;
+        }
+
+        if (r.seek + 1 >= r.buffer.len) return Error.MalformedBuffer;
+        // advance to next key's first byte, or to the dict's 'e'
+        // cursor at 3:foo
+        //           ^
         r.toss(1);
-        @field(dict, n) = try decode(t, r);
     }
 
-    r.toss(1);
+    if (seen.count() != s.field_names.len) return Error.MissingField;
     return dict;
 }
 
@@ -252,20 +278,15 @@ fn decode_list_arr(comptime Arr: Type.Array, r: *Reader) ![Arr.len]Arr.child {
 
 /// Zero-copy string decoding, just return a slice into `r`.
 fn decode_str(r: *Reader) ![]u8 {
-    if (r.buffer[r.seek..].len < 2) {
-        return Error.MalformedBuffer;
-    }
-    // empty string
-    if (std.mem.eql(u8, r.buffer[r.seek..], "0:")) {
-        return r.buffer[r.seek..];
-    }
-    const colon = std.mem.find(
+    const colon = std.mem.findScalar(
         u8,
         r.buffer[r.seek..],
-        ":",
+        ':',
     ) orelse return Error.MissingColon;
-    const len_slice = r.buffer[r.seek .. r.seek + colon];
-    const len = try std.fmt.parseInt(usize, len_slice, 10);
+    if (colon == 0) return Error.MalformedBuffer;
+    const len = try std.fmt.parseInt(usize, r.buffer[r.seek..][0..colon], 10);
+    const data_start = r.seek + colon + 1;
+    if (data_start + len > r.buffer.len) return Error.MalformedBuffer;
     const str =
         r.buffer[r.seek + colon + 1 .. r.seek + colon + len + 1];
     r.toss(colon + len);
@@ -299,28 +320,6 @@ fn decode_str_arr(comptime Arr: Type.Array, r: *Reader) ![Arr.len]u8 {
     var arr: [Arr.len]u8 = undefined;
     @memcpy(&arr, str);
     return arr;
-}
-
-fn skip_str(r: *Reader) !void {
-    if (r.buffer[r.seek..].len < 2) {
-        return Error.MalformedBuffer;
-    }
-
-    // empty string
-    if (std.mem.eql(u8, r.buffer[r.seek..], "0:")) {
-        r.toss(1);
-        return;
-    }
-
-    const colon = std.mem.find(
-        u8,
-        r.buffer[r.seek..],
-        ":",
-    ) orelse return Error.MissingColon;
-
-    const len_slice = r.buffer[r.seek .. r.seek + colon];
-    const len = try std.fmt.parseInt(usize, len_slice, 10);
-    r.toss(colon + len);
 }
 
 /// Decode an integer, encoded as `i<base10 integer>e`.
@@ -565,70 +564,52 @@ test "decode_dict_1" {
 test "decode_dict_2" {
     const MyDict = extern struct {
         foo: u8,
+        ber: u32,
+        zip: [7]u8,
+    };
+    const encoded = "d3:beri321e3:fooi3e3:zip7:avocadoe";
+    var r = Reader.fixed(encoded);
+    const s = try decode(MyDict, &r);
+    try expect(s.foo == 3);
+    try expect(s.ber == 321);
+    try expect(std.mem.eql(u8, &s.zip, "avocado"));
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_dict_unsorted_1" {
+    const MyDict = extern struct {
+        foo: u8,
         bar: u32,
         zip: [7]u8,
     };
     const encoded = "d3:fooi3e3:bari321e3:zip7:avocadoe";
     var r = Reader.fixed(encoded);
-    const s = try decode(MyDict, &r);
-    try expect(s.foo == 3);
-    try expect(s.bar == 321);
-    try expect(std.mem.eql(u8, &s.zip, "avocado"));
-    try expect(r.seek == encoded.len - 1);
+    const err = decode(MyDict, &r);
+    try expect(err == Error.UnsortedKeys);
 }
 
-test "decode_dict_3" {
-    const MyDict = struct {
+test "decode_dict_dupe_1" {
+    const MyDict = extern struct {
         foo: u8,
         bar: u32,
-        zip: []u8,
-        arr: [2]i8,
+        zip: [7]u8,
     };
-    const encoded = "d3:fooi3e3:bari321e3:zip7:avocado3:arrli1ei2eee";
+    const encoded = "d3:bari321e3:bari321e3:fooi3e3:zip7:avocadoe";
     var r = Reader.fixed(encoded);
-    const s = try decode(MyDict, &r);
-    try expect(s.foo == 3);
-    try expect(s.bar == 321);
-    try expect(std.mem.eql(u8, s.zip, "avocado"));
-    try expect(s.arr[0] == 1);
-    try expect(s.arr[1] == 2);
-    try expect(r.seek == encoded.len - 1);
+    const err = decode(MyDict, &r);
+    try expect(err == Error.DuplicateKey);
 }
 
-// test "decode_empty_dict_1" {
-//     const MyDict = struct {
-//         foo: u8,
-//         bar: u32,
-//         zip: []u8,
-//         arr: [2]i8,
-//     };
-//     const encoded = "de";
-//     var r = Reader.fixed(encoded);
-//     const s = try decode(MyDict, &r);
-//     try expect(std.mem.eql(u8, s.zip, "avocado"));
-// }
-
-test "decode_dict_4" {
-    const MyDict2 = struct {
-        foo: u8,
-    };
-    const MyDict = struct {
+test "decode_dict_missing_1" {
+    const MyDict = extern struct {
         foo: u8,
         bar: u32,
-        dic: MyDict2,
-        zip: []const u8,
-        arr: [2]i8,
+        zip: [7]u8,
     };
-    const encoded = "d3:fooi3e3:bari321e3:dicd3:fooi6ee3:zip7:avocado3:arrli1ei2eee";
+    const encoded = "d3:bari321e3:fooi3ee";
     var r = Reader.fixed(encoded);
-    const s = try decode(MyDict, &r);
-    try expect(s.foo == 3);
-    try expect(s.bar == 321);
-    try expect(s.dic.foo == 6);
-    try expect(std.mem.eql(u8, s.zip, "avocado"));
-    try expect(s.arr[0] == 1);
-    try expect(s.arr[1] == 2);
-    try expect(r.seek == encoded.len - 1);
+    const err = decode(MyDict, &r);
+    try expect(err == Error.MissingField);
 }
 
 test "decode_arr_u32_1" {
@@ -670,7 +651,8 @@ test "decode_empty_str" {
     const encoded = "0:";
     var r = Reader.fixed(encoded);
     const view = try decode([]u8, &r);
-    try expect(std.mem.eql(u8, view, "0:"));
+    try expect(view.len == 0);
+    try expect(std.mem.eql(u8, view, ""));
 }
 
 test "decode_arr_str_1" {
@@ -820,7 +802,7 @@ test "decode_str_no_len" {
     const encoded = ":hih";
     var r = Reader.fixed(encoded);
     const err = decode([]const u8, &r);
-    try expect(err == error.InvalidCharacter);
+    try expect(err == error.MalformedBuffer);
 }
 
 test "decode_str_missing_colon" {
