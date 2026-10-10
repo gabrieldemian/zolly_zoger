@@ -1,5 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const Type = std.lang.Type;
+const print = std.debug.print;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 const Allocator = std.mem.Allocator;
@@ -11,6 +13,9 @@ pub const Error = error{
     NotSupported,
     LeadingZero,
     MissingColon,
+    StringWrongLen,
+    InvalidCharacter,
+    OutOfBounds,
 };
 
 /// Get the size that a value have when encoded.
@@ -316,11 +321,7 @@ fn decode_list(
 /// Decode a byte str, encoded as `<length>:<contents>`.
 /// `<length>` is specified in bytes, not characters.
 /// For example: `6:italia`.
-fn decode_str(
-    arr: [:0]u8,
-    r: *Reader,
-) !void {
-    // std.debug.print("wtf {s}\n", .{r.buffer[r.seek..]});
+fn decode_str(arr: [:0]u8, r: *Reader) !void {
     if (r.buffer[r.seek..].len < 2) {
         return Error.MalformedBuffer;
     }
@@ -341,12 +342,11 @@ fn decode_str(
     const len = try std.fmt.parseInt(usize, len_slice, 10);
     const str =
         r.buffer[r.seek + colon + 1 .. r.seek + colon + len + 1];
+
     @memcpy(arr, str);
 
     // assert(Str.len == len);
     r.toss(colon + len);
-    // return str[0..Str.len:0].*;
-    return;
 }
 
 fn skip_str(r: *Reader) !void {
@@ -374,49 +374,62 @@ fn skip_str(r: *Reader) !void {
 /// Decode an integer, encoded as `i<base10 integer>e`.
 /// For example: `i123e`
 fn decode_int(comptime T: type, r: *Reader) !T {
-    const Int = @typeInfo(T).int;
-
     if (r.buffer[r.seek..].len < 3) {
         return Error.MalformedBuffer;
     }
 
-    if (r.buffer[r.seek..][0] != 'i') {
-        return Error.MalformedBuffer;
+    const Int = @typeInfo(T).int;
+    const U = @Int(.unsigned, Int.bits);
+
+    var result: U = 0;
+    var seen_digit = false;
+    var leading_zero = false;
+    var negate = false;
+
+    sw: switch (r.buffer[r.seek]) {
+        'i' => {
+            r.toss(1);
+            continue :sw r.buffer[r.seek];
+        },
+        '0' => {
+            if (leading_zero) return Error.LeadingZero;
+            if (negate and !seen_digit) return Error.LeadingZero;
+            if (!seen_digit) leading_zero = true;
+            seen_digit = true;
+            if (r.seek + 1 == r.buffer.len) return Error.OutOfBounds;
+            r.toss(1);
+            continue :sw r.buffer[r.seek];
+        },
+        '1'...'9' => |c| {
+            if (leading_zero) return Error.LeadingZero;
+            seen_digit = true;
+            result = try std.math.mul(U, result, 10);
+            result = try std.math.add(U, result, c - '0');
+            if (r.seek + 1 == r.buffer.len) return Error.OutOfBounds;
+            r.toss(1);
+            continue :sw r.buffer[r.seek];
+        },
+        '-' => {
+            if (Int.signedness == .unsigned) {
+                return Error.UnexpectedSign;
+            }
+            negate = true;
+            if (r.seek + 1 == r.buffer.len) return Error.OutOfBounds;
+            r.toss(1);
+            continue :sw r.buffer[r.seek];
+        },
+        'e' => break :sw,
+        else => return Error.InvalidCharacter,
     }
 
-    const end = std.mem.find(
-        u8,
-        r.buffer[r.seek..],
-        "e",
-    ) orelse return Error.MalformedBuffer;
-
-    const data = r.buffer[r.seek .. r.seek + end + 1];
-
-    if (data[1] == '0' and data.len > 3) {
-        return Error.LeadingZero;
+    if (Int.signedness == .signed) {
+        if (!negate) return std.math.cast(T, result) orelse error.Overflow;
+        const limit: U = @as(U, 1) << (Int.bits - 1);
+        if (result > limit) return error.Overflow;
+        if (result == limit) return std.math.minInt(T);
+        return -@as(T, @intCast(result));
     }
-
-    const is_negative = data[1] == '-';
-
-    if (Int.signedness == .unsigned and is_negative) {
-        return Error.UnexpectedSign;
-    }
-
-    // -0 is not valid
-    if (is_negative and data[2] == '0') {
-        return Error.LeadingZero;
-    }
-
-    const result: T = std.fmt.parseInt(
-        T,
-        data[1 .. data.len - 1],
-        10,
-    ) catch |err| {
-        return err;
-    };
-
-    r.toss(data.len - 1);
-    return result;
+    return @intCast(result);
 }
 
 /// Return the number of digits of a number.
@@ -595,13 +608,12 @@ test "decode_dict_2" {
         zip: [7:0]u8,
     };
     const encoded = "d3:fooi3e3:bari321e3:zip7:avocadoe";
-
     var r = Reader.fixed(encoded);
     const s = try decode(MyDict, &r);
 
-    std.debug.print("foo = {}\n", .{s.foo});
-    std.debug.print("bar = {}\n", .{s.bar});
-    std.debug.print("zip = {s}\n", .{&s.zip});
+    // std.debug.print("foo = {}\n", .{s.foo});
+    // std.debug.print("bar = {}\n", .{s.bar});
+    // std.debug.print("zip = {s}\n", .{&s.zip});
 
     try expect(s.foo == 3);
     try expect(s.bar == 321);
@@ -771,170 +783,128 @@ test "decode_dict_2" {
 //     try expect(re == Error.Empty);
 //     try expect(r.seek == encoded.len - 1);
 // }
-//
-// // Test numbers not close to the max
-// test "decode_u8" {
-//     const encoded = "i50e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(u8, &r, &w);
-//     const num: *u8 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == 50);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// test "decode_i8" {
-//     const encoded = "i-50e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(i8, &r, &w);
-//     const num: *i8 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == -50);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// test "decode_u16" {
-//     const encoded = "i65535e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [2]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(u16, &r, &w);
-//     const num: *u16 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == 65_535);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// test "decode_i16_1" {
-//     const encoded = "i-32768e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [2]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(i16, &r, &w);
-//     const num: *i16 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == -32_768);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// // Test the max value of a signed int and that the minus sign is optional.
-// test "decode_i16_2" {
-//     const encoded = "i32767e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [2]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(i16, &r, &w);
-//     const num: *i16 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == 32_767);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// test "decode_u32" {
-//     const encoded = "i4294967295e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [4]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(u32, &r, &w);
-//     const num: *u32 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == 4_294_967_295);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// test "decode_i32" {
-//     const encoded = "i-2147483648e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [4]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(i32, &r, &w);
-//     const num: *i32 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == -2_147_483_648);
-//     try expect(r.seek == encoded.len - 1);
-// }
-//
-// test "decode_zero" {
-//     const encoded = "i0e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(u8, &r, &w);
-//     const num: *u8 = @ptrCast(@alignCast(&buff));
-//     try expect(num.* == 0);
-//     try expect(r.seek == encoded.len - 1);
-// }
+
+// Test numbers not close to the max
+test "decode_u8" {
+    const encoded = "i50e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(u8, &r);
+    print("num {d}\n", .{num});
+    try expect(num == 50);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_i8" {
+    const encoded = "i-50e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(i8, &r);
+    try expect(num == -50);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_u16" {
+    const encoded = "i65535e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(u16, &r);
+    try expect(num == 65_535);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_i16_1" {
+    const encoded = "i-32768e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(i16, &r);
+    try expect(num == -32_768);
+    try expect(r.seek == encoded.len - 1);
+}
+
+// Test the max value of a signed int and that the minus sign is optional.
+test "decode_i16_2" {
+    const encoded = "i32767e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(i16, &r);
+    try expect(num == 32_767);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_u32" {
+    const encoded = "i4294967295e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(u32, &r);
+    try expect(num == 4_294_967_295);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_i32" {
+    const encoded = "i-2147483648e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(i32, &r);
+    try expect(num == -2_147_483_648);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_zero" {
+    const encoded = "i0e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(u8, &r);
+    try expect(num == 0);
+    try expect(r.seek == encoded.len - 1);
+}
 
 // Test errors
 
-// test "decode_leading_zero_1" {
-//     const encoded = "i02e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     const err = decode(u8, &r, &w);
-//     try expect(err == Error.LeadingZero);
-//     try expect(r.seek == 0);
-// }
-//
-// test "decode_leading_zero_2" {
-//     const encoded = "i-0e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     const err = decode(i8, &r, &w);
-//     try expect(err == Error.LeadingZero);
-//     try expect(r.seek == 0);
-// }
-//
-// test "decode_overflow_1" {
-//     const encoded = "i256e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     const err = decode(u8, &r, &w);
-//     try expect(err == error.Overflow);
-//     try expect(r.seek == 0);
-// }
-//
-// test "decode_overflow_2" {
-//     const encoded = "i-296e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     const err = decode(i8, &r, &w);
-//     try expect(err == error.Overflow);
-//     try expect(r.seek == 0);
-// }
-//
-// test "decode_non_int" {
-//     const encoded = "i12#e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     const err = decode(i8, &r, &w);
-//     try expect(err == error.InvalidCharacter);
-//     try expect(r.seek == 0);
-// }
-//
-// test "decode_int_missing_e" {
-//     const encoded = "i12";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     const err = decode(i8, &r, &w);
-//     try expect(err == Error.MalformedBuffer);
-//     try expect(r.seek == 0);
-// }
-//
-// test "decode_str_wrong_len" {
+test "decode_leading_zero_1" {
+    const encoded = "i02e";
+    var r = Reader.fixed(encoded);
+    const err = decode(u8, &r);
+    try expect(err == Error.LeadingZero);
+}
+
+test "decode_leading_zero_2" {
+    const encoded = "i-0e";
+    var r = Reader.fixed(encoded);
+    const err = decode(i8, &r);
+    try expect(err == Error.LeadingZero);
+}
+
+test "decode_overflow_1" {
+    const encoded = "i256e";
+    var r = Reader.fixed(encoded);
+    const err = decode(u8, &r);
+    try expect(err == error.Overflow);
+}
+
+test "decode_overflow_2" {
+    const encoded = "i-296e";
+    var r = Reader.fixed(encoded);
+    const err = decode(i8, &r);
+    try expect(err == error.Overflow);
+}
+
+test "decode_non_int" {
+    const encoded = "i12#e";
+    var r = Reader.fixed(encoded);
+    const err = decode(i8, &r);
+    try expect(err == error.InvalidCharacter);
+}
+
+test "decode_int_missing_e" {
+    const encoded = "i12";
+    var r = Reader.fixed(encoded);
+    const err = decode(i8, &r);
+    print("err {!}\n", .{err});
+    try expect(err == Error.OutOfBounds);
+}
+
+// test "decode_str_with_garbage" {
 //     // should ignore all the rest of the string
 //     const encoded = "2:higarbage";
 //     var r = Reader.fixed(encoded);
-//     var buff: [2]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode([:0]u8, &r, &w);
-//     try expect(std.mem.eql(u8, &buff, "hi"));
+//     const hi = try decode([:0]u8, &r);
+//     try expect(std.mem.eql(u8, hi, "hi"));
 //     try expect(r.seek == 3);
 // }
-//
+
 // test "decode_str_no_len" {
 //     const encoded = ":hih";
 //     var r = Reader.fixed(encoded);
