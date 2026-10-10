@@ -16,6 +16,8 @@ pub const Error = error{
     StringWrongLen,
     InvalidCharacter,
     OutOfBounds,
+    NonExhaustiveEnum,
+    InvalidEnum,
 };
 
 /// Get the size that a value have when encoded.
@@ -215,7 +217,13 @@ fn Decode_Return(comptime T: type) type {
 pub fn decode(comptime T: type, r: *Reader) !T {
     return switch (@typeInfo(T)) {
         inline .int => try decode_int(T, r),
-        // inline .@"enum" => |en| try decode_int(en.tag_type, r, w),
+        inline .@"enum" => |en| {
+            if (en.mode == .nonexhaustive) return Error.NonExhaustiveEnum;
+            return std.enums.fromInt(
+                T,
+                try decode_int(en.tag_type, r),
+            ) orelse Error.InvalidEnum;
+        },
         inline .@"struct" => try decode_dict(T, r),
         inline .array => |arr| {
             if (arr.sentinel() != null) return Error.NotSupported;
@@ -585,23 +593,30 @@ const expect = std.testing.expect;
 // decode
 // ------
 
-// test "decode_enum" {
-//     const MyEnum = enum(u8) {
-//         Core,
-//         ExtHandshake,
-//         Metainfo,
-//     };
-//     const encoded = "i1e";
-//     var r = Reader.fixed(encoded);
-//     var buff: [1]u8 = undefined;
-//     var w = Writer.fixed(&buff);
-//     try decode(MyEnum, &r, &w);
-//     const num: MyEnum = @enumFromInt(buff[0]);
-//     // const num: *MyEnum = @ptrCast(@alignCast(&buff));
-//     // try expect(num.* == .ExtHandshake);
-//     try expect(num == .ExtHandshake);
-//     try expect(r.seek == encoded.len - 1);
-// }
+test "decode_enum_1" {
+    const MyEnum = enum(u8) {
+        Core,
+        ExtHandshake,
+        Metainfo,
+    };
+    const encoded = "i1e";
+    var r = Reader.fixed(encoded);
+    const num = try decode(MyEnum, &r);
+    try expect(num == .ExtHandshake);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_enum_2" {
+    const MyEnum = enum(u8) {
+        Core,
+        ExtHandshake,
+        Metainfo,
+    };
+    const encoded = "i3e";
+    var r = Reader.fixed(encoded);
+    const err = decode(MyEnum, &r);
+    try expect(err == Error.InvalidEnum);
+}
 
 test "decode_dict_1" {
     const MyDict = struct {
