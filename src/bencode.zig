@@ -18,7 +18,6 @@ pub const Error = error{
     OutOfBounds,
     NonExhaustiveEnum,
     InvalidEnum,
-    UnknownKey,
     UnsortedKeys,
     DuplicateKey,
     MissingField,
@@ -134,7 +133,7 @@ pub fn decode(comptime T: type, r: *Reader) !T {
             // [32]u8 = string [:0]u8 = string
             if (arr.child == u8) return try decode_str_arr(arr, r);
             // [12]u32 [8]Dict
-            return decode_list_arr(arr, r);
+            return decode_list(arr, r);
         },
         inline .pointer => |p| {
             // []u8
@@ -144,7 +143,7 @@ pub fn decode(comptime T: type, r: *Reader) !T {
                 // []u8
                 inline .array => |arr| {
                     if (arr.child == u8) return try decode_str(r);
-                    return try decode_list_arr(arr, r);
+                    return try decode_list(arr, r);
                 },
                 // [*]u8
                 inline .int => |int| {
@@ -271,30 +270,24 @@ fn skip_value(r: *Reader) !void {
             }
             if (r.seek >= r.buffer.len) return Error.MalformedBuffer;
         },
-        '0'...'9' => {
-            _ = try decode_str(r);
-        },
+        '0'...'9' => _ = try decode_str(r),
         else => return Error.InvalidCharacter,
     }
 }
 
 /// Lists are encoded as `l<elements>e`.
 /// For example: `l3:foo:bare`.
-fn decode_list_arr(comptime Arr: Type.Array, r: *Reader) ![Arr.len]Arr.child {
+fn decode_list(comptime Arr: Type.Array, r: *Reader) ![Arr.len]Arr.child {
     const data = r.buffer[r.seek..];
 
-    // empty list
-    if (std.mem.eql(u8, data, "le")) {
+    if (data.len < 2 or data[0] != 'l') {
+        return Error.MalformedBuffer;
+    }
+
+    if (data[1] == 'e') {
+        if (Arr.len != 0) return Error.Empty;
         r.toss(1);
-        return std.mem.zeroes([Arr.len]Arr.child);
-    }
-
-    if (data.len < 3) {
-        return Error.MalformedBuffer;
-    }
-
-    if (data[0] != 'l' or data[data.len - 1] != 'e') {
-        return Error.MalformedBuffer;
+        return .{};
     }
 
     var arr: [Arr.len]Arr.child = undefined;
@@ -307,6 +300,9 @@ fn decode_list_arr(comptime Arr: Type.Array, r: *Reader) ![Arr.len]Arr.child {
     }
 
     r.toss(1);
+    if (r.buffer[r.seek] != 'e') {
+        return Error.MalformedBuffer;
+    }
     return arr;
 }
 
@@ -321,8 +317,7 @@ fn decode_str(r: *Reader) ![]u8 {
     const len = try std.fmt.parseInt(usize, r.buffer[r.seek..][0..colon], 10);
     const data_start = r.seek + colon + 1;
     if (data_start + len > r.buffer.len) return Error.MalformedBuffer;
-    const str =
-        r.buffer[r.seek + colon + 1 .. r.seek + colon + len + 1];
+    const str = r.buffer[data_start .. data_start + len];
     r.toss(colon + len);
     return str;
 }
@@ -331,13 +326,6 @@ fn decode_str(r: *Reader) ![]u8 {
 /// `<length>` is specified in bytes, not characters.
 /// For example: `6:italia`.
 fn decode_str_arr(comptime Arr: Type.Array, r: *Reader) ![Arr.len]u8 {
-    if (r.buffer[r.seek..].len < 2) {
-        return Error.MalformedBuffer;
-    }
-    // empty string
-    if (std.mem.eql(u8, r.buffer[r.seek..], "0:")) {
-        return std.mem.zeroes([Arr.len]Arr.child);
-    }
     const colon = std.mem.find(
         u8,
         r.buffer[r.seek..],
@@ -345,11 +333,14 @@ fn decode_str_arr(comptime Arr: Type.Array, r: *Reader) ![Arr.len]u8 {
     ) orelse return Error.MissingColon;
     const len_slice = r.buffer[r.seek .. r.seek + colon];
     const len = try std.fmt.parseInt(usize, len_slice, 10);
-    if (len < Arr.len) {
-        return Error.OutOfBounds;
+    if (len != Arr.len) {
+        return Error.StringWrongLen;
     }
-    const str =
-        r.buffer[r.seek + colon + 1 .. r.seek + colon + len + 1];
+    const start = r.seek + colon + 1;
+    if (start + len > r.buffer.len) {
+        return Error.MalformedBuffer;
+    }
+    const str = r.buffer[start..][0..len];
     r.toss(colon + len);
     var arr: [Arr.len]u8 = undefined;
     @memcpy(&arr, str);
@@ -717,6 +708,32 @@ test "decode_list_str_1" {
     try expect(r.seek == encoded.len - 1);
 }
 
+test "decode_list_nested_1" {
+    const encoded = "lli1ei2eeli3ei4eee";
+    var r = Reader.fixed(encoded);
+    const buff = try decode([2][2]i8, &r);
+    try expect(buff[0][0] == 1);
+    try expect(buff[0][1] == 2);
+    try expect(buff[1][0] == 3);
+    try expect(buff[1][1] == 4);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_list_nested_2" {
+    const encoded = "llelee";
+    var r = Reader.fixed(encoded);
+    const err = decode([2][2]i8, &r);
+    try expect(err == Error.Empty);
+}
+
+test "decode_list_nested_3" {
+    const encoded = "llelee";
+    var r = Reader.fixed(encoded);
+    const v = try decode([2][0]i8, &r);
+    try expect(v[0].len == 0);
+    try expect(v[1].len == 0);
+}
+
 test "decode_str_1" {
     const encoded = "3:hih";
     var r = Reader.fixed(encoded);
@@ -733,12 +750,65 @@ test "decode_str_2" {
     try expect(r.seek == encoded.len - 1);
 }
 
-test "decode_empty_str" {
+test "decode_str_3" {
+    const encoded = "3:hih";
+    var r = Reader.fixed(encoded);
+    const view = try decode([]u8, &r);
+    try expect(std.mem.eql(u8, view, "hih"));
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_str_4" {
+    // TODO: should I add a check and error here?
+    const encoded = "03:hih";
+    var r = Reader.fixed(encoded);
+    const view = try decode([]u8, &r);
+    try expect(std.mem.eql(u8, view, "hih"));
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_str_5" {
+    const encoded = "7:hih";
+    var r = Reader.fixed(encoded);
+    const err = decode([]u8, &r);
+    try expect(err == Error.MalformedBuffer);
+}
+
+test "decode_str_6" {
+    const encoded = "3:hih";
+    var r = Reader.fixed(encoded);
+    const err = decode([2]u8, &r);
+    try expect(err == Error.StringWrongLen);
+}
+
+test "decode_str_7" {
+    const encoded = "1:hih";
+    var r = Reader.fixed(encoded);
+    const err = decode([2]u8, &r);
+    try expect(err == Error.StringWrongLen);
+}
+
+test "decode_str_8" {
+    const encoded = "7:hih";
+    var r = Reader.fixed(encoded);
+    const err = decode([2]u8, &r);
+    try expect(err == Error.StringWrongLen);
+}
+
+test "decode_empty_str_1" {
     const encoded = "0:";
     var r = Reader.fixed(encoded);
     const view = try decode([]u8, &r);
     try expect(view.len == 0);
     try expect(std.mem.eql(u8, view, ""));
+}
+
+test "decode_empty_str_2" {
+    const encoded = "0:";
+    var r = Reader.fixed(encoded);
+    const view = try decode([0]u8, &r);
+    try expect(view.len == 0);
+    try expect(std.mem.eql(u8, &view, ""));
 }
 
 test "decode_arr_str_1" {
@@ -752,9 +822,8 @@ test "decode_arr_str_1" {
 test "decode_empty_arr_1" {
     const encoded = "le";
     var r = Reader.fixed(encoded);
-    const re = try decode([1]u32, &r);
-    try expect(re[0] == 0);
-    try expect(r.seek == encoded.len - 1);
+    const err = decode([1]u32, &r);
+    try expect(err == Error.Empty);
 }
 
 test "decode_empty_arr_2" {
