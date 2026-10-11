@@ -166,10 +166,19 @@ fn encode_list(comptime value: anytype, w: *Writer) !void {
     try w.writeByte('e');
 }
 
+fn string_alphabetically(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
+}
+
 fn encode_dict(comptime value: anytype, w: *Writer) !void {
-    const Str = @typeInfo(@TypeOf(value)).@"struct";
+    const Struct = @typeInfo(@TypeOf(value)).@"struct";
     try w.writeByte('d');
-    inline for (Str.field_names) |name| {
+
+    comptime var sorted: [Struct.field_names.len][]const u8 = undefined;
+    comptime @memcpy(&sorted, Struct.field_names);
+    comptime std.mem.sortUnstable([]const u8, &sorted, {}, string_alphabetically);
+
+    inline for (sorted) |name| {
         try encode_str(name, w);
         try encode(@field(value, name), w);
     }
@@ -210,13 +219,17 @@ fn decode_dict(comptime T: type, r: *Reader) !T {
         //             ^
 
         // advance into the value's first byte
+        r.toss(1);
         // cursor at d3:foo
         //              ^
-        r.toss(1);
 
         if (prev_key) |pk| {
-            // if (std.mem.order(u8, pk, key) != .lt) return Error.UnsortedKeys;
-            if (std.mem.order(u8, pk, key) == .gt) return Error.UnsortedKeys;
+            // compare order of the current key and previous key
+            switch (std.mem.order(u8, pk, key)) {
+                .lt => {}, // sorted
+                .eq => return Error.DuplicateKey,
+                .gt => return Error.UnsortedKeys,
+            }
         }
         prev_key = key;
 
@@ -224,13 +237,12 @@ fn decode_dict(comptime T: type, r: *Reader) !T {
             inline for (s.field_names, s.field_types) |n, ft| {
                 if (std.mem.eql(u8, n, key)) {
                     const F = std.meta.FieldEnum(T);
-                    if (seen.contains(@field(F, n))) return Error.DuplicateKey;
                     seen.insert(@field(F, n));
                     @field(dict, n) = try decode(ft, r);
                     break :found;
                 }
             }
-            return Error.UnknownKey;
+            try skip_value(r);
         }
 
         if (r.seek + 1 >= r.buffer.len) return Error.MalformedBuffer;
@@ -242,6 +254,28 @@ fn decode_dict(comptime T: type, r: *Reader) !T {
 
     if (seen.count() != s.field_names.len) return Error.MissingField;
     return dict;
+}
+
+fn skip_value(r: *Reader) !void {
+    switch (r.buffer[r.seek]) {
+        'i' => {
+            while (r.seek < r.buffer.len and r.buffer[r.seek] != 'e') r.toss(1);
+            if (r.seek >= r.buffer.len) return Error.MalformedBuffer;
+        },
+        'l', 'd' => {
+            r.toss(1);
+            while (r.seek < r.buffer.len and r.buffer[r.seek] != 'e') {
+                try skip_value(r);
+                if (r.seek + 1 >= r.buffer.len) return Error.MalformedBuffer;
+                r.toss(1);
+            }
+            if (r.seek >= r.buffer.len) return Error.MalformedBuffer;
+        },
+        '0'...'9' => {
+            _ = try decode_str(r);
+        },
+        else => return Error.InvalidCharacter,
+    }
 }
 
 /// Lists are encoded as `l<elements>e`.
@@ -423,7 +457,7 @@ test "encode_dict" {
     var buffer: [34]u8 = undefined;
     var w = Writer.fixed(&buffer);
     try encode(v, &w);
-    try expect(std.mem.eql(u8, &buffer, "d3:fooi3e3:bari321e3:zip7:avocadoe"));
+    try expect(std.mem.eql(u8, &buffer, "d3:bari321e3:fooi3e3:zip7:avocadoe"));
 }
 
 test "encode_list_1" {
@@ -562,7 +596,7 @@ test "decode_dict_1" {
 }
 
 test "decode_dict_2" {
-    const MyDict = extern struct {
+    const MyDict = struct {
         foo: u8,
         ber: u32,
         zip: [7]u8,
@@ -577,7 +611,7 @@ test "decode_dict_2" {
 }
 
 test "decode_dict_unsorted_1" {
-    const MyDict = extern struct {
+    const MyDict = struct {
         foo: u8,
         bar: u32,
         zip: [7]u8,
@@ -589,7 +623,7 @@ test "decode_dict_unsorted_1" {
 }
 
 test "decode_dict_dupe_1" {
-    const MyDict = extern struct {
+    const MyDict = struct {
         foo: u8,
         bar: u32,
         zip: [7]u8,
@@ -601,7 +635,7 @@ test "decode_dict_dupe_1" {
 }
 
 test "decode_dict_missing_1" {
-    const MyDict = extern struct {
+    const MyDict = struct {
         foo: u8,
         bar: u32,
         zip: [7]u8,
@@ -610,6 +644,58 @@ test "decode_dict_missing_1" {
     var r = Reader.fixed(encoded);
     const err = decode(MyDict, &r);
     try expect(err == Error.MissingField);
+}
+
+// Ignore unknown keys as long as they are sorted and unique
+test "decode_dict_ignore_1" {
+    const MyDict = struct {
+        foo: u8,
+    };
+    const encoded = "d3:bari321e3:fooi3ee";
+    var r = Reader.fixed(encoded);
+    const s = try decode(MyDict, &r);
+    try expect(s.foo == 3);
+    try expect(r.seek == encoded.len - 1);
+}
+
+test "decode_dict_ignore_2" {
+    const MyDict = struct {
+        foo: u8,
+    };
+    // nested = d3:eeed1:ei7eee
+    // bar, foo, nested
+    const encoded = "d3:bari321e3:fooi3e6:nestedd3:eeed1:ei7eeee";
+    var r = Reader.fixed(encoded);
+    const s = try decode(MyDict, &r);
+    try expect(s.foo == 3);
+    try expect(r.seek == encoded.len - 1);
+}
+
+// Enforce uniqueness and sortedness even for unknown keys
+// Can't ignore this because the unknown key is duplicated
+test "decode_dict_ignore_3" {
+    const MyDict = struct {
+        foo: u8,
+    };
+    // nested = d3:eeed1:ei7eee
+    // bar, nested, foo
+    const encoded = "d3:bari321e6:nestedd3:eeed1:ei7eee3:fooi3ee";
+    var r = Reader.fixed(encoded);
+    const err = decode(MyDict, &r);
+    try expect(err == Error.UnsortedKeys);
+}
+
+// Can't ignore this because the unknown key is duplicated
+test "decode_dict_ignore_4" {
+    const MyDict = struct {
+        foo: u8,
+    };
+    // nested = d3:eeed1:ei7eee
+    // bar, foo, nested, nested
+    const encoded = "d3:bari321e3:fooi3e6:nestedd3:eeed1:ei7eee6:nestedd3:eeed1:ei7eeee";
+    var r = Reader.fixed(encoded);
+    const err = decode(MyDict, &r);
+    try expect(err == Error.DuplicateKey);
 }
 
 test "decode_arr_u32_1" {
