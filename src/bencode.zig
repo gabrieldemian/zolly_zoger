@@ -21,7 +21,11 @@ pub const Error = error{
     UnsortedKeys,
     DuplicateKey,
     MissingField,
+    ReachedRecursionLimit,
 };
+
+var recursion_i: u8 = 0;
+pub var RECURSION_LIMIT: u8 = 64;
 
 /// Get the size that a value have when encoded.
 fn size_of(comptime value: anytype) !usize {
@@ -158,6 +162,9 @@ pub fn decode(comptime T: type, r: *Reader) !T {
 }
 
 fn encode_list(comptime value: anytype, w: *Writer) !void {
+    try bump_recursion();
+    defer dec_recursion();
+
     try w.writeByte('l');
     inline for (value) |f| {
         try encode(f, w);
@@ -170,6 +177,9 @@ fn string_alphabetically(_: void, lhs: []const u8, rhs: []const u8) bool {
 }
 
 fn encode_dict(comptime value: anytype, w: *Writer) !void {
+    try bump_recursion();
+    defer dec_recursion();
+
     const Struct = @typeInfo(@TypeOf(value)).@"struct";
     try w.writeByte('d');
 
@@ -199,6 +209,9 @@ fn encode_int(value: anytype, w: *Writer) !void {
 /// Dicts are encoded as `d<str><val>e`.
 /// For example: `d3:fooi2ee`.
 fn decode_dict(comptime T: type, r: *Reader) !T {
+    try bump_recursion();
+    defer dec_recursion();
+
     if (r.seek >= r.buffer.len or r.buffer[r.seek] != 'd') return Error.MalformedBuffer;
 
     var dict: T = undefined;
@@ -278,6 +291,9 @@ fn skip_value(r: *Reader) !void {
 /// Lists are encoded as `l<elements>e`.
 /// For example: `l3:foo:bare`.
 fn decode_list(comptime Arr: Type.Array, r: *Reader) ![Arr.len]Arr.child {
+    try bump_recursion();
+    defer dec_recursion();
+
     const data = r.buffer[r.seek..];
 
     if (data.len < 2 or data[0] != 'l') {
@@ -387,9 +403,7 @@ fn decode_int(comptime T: type, r: *Reader) !T {
             continue :sw r.buffer[r.seek];
         },
         '-' => {
-            if (Int.signedness == .unsigned) {
-                return Error.UnexpectedSign;
-            }
+            if (Int.signedness == .unsigned) return Error.UnexpectedSign;
             negate = true;
             if (r.seek + 1 == r.buffer.len) return Error.OutOfBounds;
             r.toss(1);
@@ -424,6 +438,20 @@ fn get_num_digits(comptime n: usize) usize {
         v = @divTrunc(v, 10);
     }
     return enc_size;
+}
+
+fn bump_recursion() !void {
+    if (recursion_i == RECURSION_LIMIT) {
+        return Error.ReachedRecursionLimit;
+    }
+    recursion_i = std.math.add(@TypeOf(recursion_i), recursion_i, 1) catch {
+        recursion_i = 0;
+        return error.Overflow;
+    };
+}
+
+fn dec_recursion() void {
+    if (recursion_i > 0) recursion_i -= 1;
 }
 
 const expect = std.testing.expect;
